@@ -61,3 +61,24 @@ func TestSparkline(t *testing.T) {
 		t.Errorf("got %q", got)
 	}
 }
+
+func TestFollowPrepends(t *testing.T) {
+	t.Parallel()
+	at := func(s int64) entry { return entry{ts: time.Unix(s, 0)} }
+	m := &model{w: 80, h: 24, follow: true, followSeq: 1}
+	m.entries, m.cursor = []entry{at(2), at(1)}, 1
+	m.Update(tailMsg{seq: 1, entries: []entry{at(3)}})
+	if len(m.entries) != 3 || !m.entries[0].ts.Equal(time.Unix(3, 0)) || m.cursor != 2 {
+		t.Fatalf("entries %v cursor %d, want the new entry on top and the cursor on the same entry", m.entries, m.cursor)
+	}
+	m.cursor, m.top = 0, 0
+	m.Update(tailMsg{seq: 1, entries: []entry{at(4)}})
+	if m.cursor != 0 {
+		t.Errorf("cursor %d, want it to stay on the newest entry", m.cursor)
+	}
+	m.Update(tailMsg{seq: 0, entries: []entry{at(5)}})
+	m.Update(tailMsg{seq: 1, gen: 7, entries: []entry{at(5)}})
+	if len(m.entries) != 4 {
+		t.Errorf("%d entries, want stale polls dropped", len(m.entries))
+	}
+}

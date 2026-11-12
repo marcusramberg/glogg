@@ -33,6 +33,8 @@ const (
 	keyEsc   = "esc"
 
 	rangeLayout = "2006-01-02 15:04:05"
+
+	followEvery = 5 * time.Second // 12 reads a minute, well inside the 60 a project allows
 )
 
 var (
@@ -68,6 +70,15 @@ type entriesMsg struct {
 
 // continueMsg asks for the next page of query generation gen.
 type continueMsg int
+
+// followMsg is a tick of follow session seq; tailMsg is what its poll found.
+type followMsg int
+
+type tailMsg struct {
+	seq, gen int
+	entries  []entry
+	err      error
+}
 
 type projectsMsg struct {
 	projects []field
@@ -106,6 +117,9 @@ type model struct {
 	loading bool
 	status  string
 
+	follow    bool
+	followSeq int // bumped per follow session, so a stale tick chain dies
+
 	input     textinput.Model
 	picker    list.Model
 	projects  []list.Item // from the cache until refreshed
@@ -138,6 +152,28 @@ func (m *model) fetch(more bool) tea.Cmd {
 	return func() tea.Msg {
 		es, next, err := m.gcp.entries(project, filter, token)
 		return entriesMsg{gen, es, next, more, err}
+	}
+}
+
+func (m *model) followTick() tea.Cmd {
+	seq := m.followSeq
+	return tea.Tick(followEvery, func(time.Time) tea.Msg { return followMsg(seq) })
+}
+
+// poll asks for entries newer than the newest one on screen.
+// shortcut: entries ingested late with an older (or identical) timestamp are missed, and a burst
+// of more than one page between polls leaves a gap; switch to the TailLogEntries stream if that matters.
+func (m *model) poll() tea.Cmd {
+	after := m.since
+	if len(m.entries) > 0 {
+		after = m.entries[0].ts
+	}
+	seq, gen, project := m.followSeq, m.gen, m.project
+	filter := buildFilter(m.filter, m.since, time.Time{}, severities[m.sev]) +
+		` AND timestamp>"` + after.UTC().Format(time.RFC3339Nano) + `"`
+	return func() tea.Msg {
+		es, _, err := m.gcp.entries(project, filter, "")
+		return tailMsg{seq, gen, es, err}
 	}
 }
 
@@ -261,6 +297,33 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, m.fetch(true)
+	case followMsg:
+		if !m.follow || int(msg) != m.followSeq {
+			return m, nil
+		}
+		// while a load is running it owns the read quota and the entry list; a custom range has no "latest"
+		if m.project == "" || m.loading || !m.until.IsZero() {
+			return m, m.followTick()
+		}
+		return m, m.poll()
+	case tailMsg:
+		if !m.follow || msg.seq != m.followSeq {
+			return m, nil
+		}
+		if msg.gen == m.gen {
+			m.status = ""
+			if msg.err != nil {
+				m.status = msg.err.Error()
+			}
+			if n := len(msg.entries); n > 0 {
+				m.entries = append(msg.entries, m.entries...)
+				if m.cursor > 0 { // reading further down: stay on the same entry
+					m.cursor += n
+					m.top += n
+				}
+			}
+		}
+		return m, m.followTick()
 	case projectsMsg:
 		if msg.err != nil {
 			m.status = msg.err.Error()
@@ -349,6 +412,19 @@ func (m *model) logsKey(k tea.KeyMsg) tea.Cmd {
 	case "s":
 		m.openChoice(modeSeverity, "Minimum severity", len(severities), m.sev, fmtSev)
 		return nil
+	case "f":
+		if !m.until.IsZero() {
+			m.status = "follow needs a relative window, not a custom range"
+			return nil
+		}
+		m.follow = !m.follow
+		if !m.follow {
+			return nil
+		}
+		m.followSeq++
+		m.cursor, m.top = 0, 0
+		seq := m.followSeq
+		return func() tea.Msg { return followMsg(seq) }
 	case "c":
 		if m.filter == "" {
 			return nil
@@ -397,7 +473,7 @@ func (m *model) rangeKey(k tea.KeyMsg) tea.Cmd {
 			m.status = err.Error()
 			return nil
 		}
-		m.mode = modeLogs
+		m.mode, m.follow = modeLogs, false
 		m.push()
 		m.since, m.until = from, to
 		return m.fetch(false)
@@ -495,6 +571,10 @@ func (m *model) View() string {
 		head.WriteString("  " + dimStyle.Render(kv[0]+":") + " " + kv[1])
 	}
 
+	if m.follow {
+		head.WriteString("  " + keyStyle.Render("following"))
+	}
+
 	filter := " " + dimStyle.Render("filter:") + " "
 	switch m.mode {
 	case modeFilter:
@@ -523,7 +603,7 @@ func (m *model) View() string {
 		footer = hints(keyEnter, "filter on field", "e", "exclude field", "/", "search", keyEsc, "back")
 	default:
 		body = m.logsView(inner)
-		footer = hints(keyEnter, "fields", "/", "filter", "c", "clear", "p", "project", "t", "window", "s", "severity", "r", "refresh", keyEsc, "back", "q", "quit")
+		footer = hints(keyEnter, "fields", "/", "filter", "c", "clear", "p", "project", "t", "window", "s", "severity", "f", "follow", "r", "refresh", keyEsc, "back", "q", "quit")
 		switch m.mode {
 		case modeFilter:
 			footer = hints(keyEnter, "apply", keyEsc, "cancel") + dimStyle.Render(" Logging query language, e.g. resource.type=\"k8s_container\" AND \"timeout\"")
@@ -579,6 +659,9 @@ func (m *model) graphView() string {
 	to := m.until
 	if to.IsZero() {
 		to = m.since.Add(windows[m.window])
+		if m.follow {
+			to = time.Now()
+		}
 	}
 	const label = "01-02 15:04"
 	return " " + dimStyle.Render(m.since.Format(label)) + " " +
