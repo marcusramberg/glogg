@@ -1,11 +1,13 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 )
 
 func TestSeverityPicker(t *testing.T) {
@@ -21,6 +23,58 @@ func TestSeverityPicker(t *testing.T) {
 	m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	if m.mode != modeLogs || severities[m.sev] != "WARNING" {
 		t.Fatalf("mode %v sev %q, want logs view with WARNING", m.mode, severities[m.sev])
+	}
+}
+
+func TestMouse(t *testing.T) {
+	t.Parallel()
+	m := &model{w: 120, h: 24}
+	m.entries = []entry{{msg: "a"}, {msg: "b", fields: []field{{k: "k", v: "v"}}}}
+	lines := func() []string { return strings.Split(ansi.Strip(m.View()), "\n") }
+	click := func(x, y int) {
+		m.Update(tea.MouseMsg{X: x, Y: y, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft})
+	}
+	rowOf := func(s string) int {
+		for y, l := range lines() {
+			if strings.Contains(l, s) {
+				return y
+			}
+		}
+		t.Fatalf("%q is not on screen", s)
+		return 0
+	}
+
+	click(5, 4) // second row of the body
+	if m.cursor != 1 || m.mode != modeLogs {
+		t.Fatalf("cursor %d mode %v, want the clicked entry selected", m.cursor, m.mode)
+	}
+	click(5, 4)
+	if m.mode != modeDetail {
+		t.Fatalf("mode %v, want a click on the selected entry to open it", m.mode)
+	}
+	click(strings.Index(lines()[23], "<esc>"), 23)
+	if m.mode != modeLogs {
+		t.Fatalf("mode %v, want the esc hint to go back", m.mode)
+	}
+
+	click(strings.Index(lines()[23], "<s>"), 23)
+	if m.mode != modeSeverity {
+		t.Fatalf("mode %v, want the severity hint to open its picker", m.mode)
+	}
+	y := rowOf("≥WARNING")
+	click(5, y)
+	if m.picker.Index() != 3 || m.mode != modeSeverity {
+		t.Fatalf("index %d mode %v, want the clicked option selected", m.picker.Index(), m.mode)
+	}
+	click(5, y)
+	if m.mode != modeLogs || severities[m.sev] != "WARNING" {
+		t.Fatalf("mode %v sev %q, want logs view with WARNING", m.mode, severities[m.sev])
+	}
+
+	m.cursor = 0
+	m.Update(tea.MouseMsg{Button: tea.MouseButtonWheelDown})
+	if m.cursor != 1 {
+		t.Errorf("cursor %d, want the wheel to scroll to the last entry", m.cursor)
 	}
 }
 

@@ -335,6 +335,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.picker.SetItems(m.projects)
 		}
 		return m, nil
+	case tea.MouseMsg:
+		return m, m.mouse(msg)
 	case tea.KeyMsg:
 		if msg.String() == "ctrl+c" {
 			return m, tea.Quit
@@ -359,6 +361,97 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.picker, cmd = m.picker.Update(msg)
 	}
 	return m, cmd
+}
+
+func (m *model) key(k tea.KeyMsg) tea.Cmd {
+	_, cmd := m.Update(k)
+	return cmd
+}
+
+// mouse maps the wheel and left clicks onto the keys that do the same thing.
+// A click selects a row; a click on the selected row is enter.
+func (m *model) mouse(e tea.MouseMsg) tea.Cmd {
+	enter := tea.KeyMsg{Type: tea.KeyEnter}
+	switch e.Button {
+	case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
+		k := tea.KeyMsg{Type: tea.KeyUp}
+		if e.Button == tea.MouseButtonWheelDown {
+			k.Type = tea.KeyDown
+		}
+		return tea.Batch(m.key(k), m.key(k), m.key(k))
+	case tea.MouseButtonLeft:
+		if e.Action != tea.MouseActionPress {
+			return nil
+		}
+	default:
+		return nil
+	}
+	row := e.Y - 3 // header, filter, top border
+	switch {
+	case e.Y == m.h-1:
+		return m.clickFooter(e.X)
+	case row < 0 || row >= m.bodyH() || m.mode == modeFilter || m.mode == modeRange:
+		return nil
+	case m.mode == modeLogs:
+		i := m.top + row
+		if i >= len(m.entries) {
+			return nil
+		}
+		if i == m.cursor {
+			return m.key(enter)
+		}
+		m.cursor = i
+		return nil
+	}
+	row -= 4 // the list's title and status bars, two lines each
+	p := m.picker.Paginator
+	i := p.Page*p.PerPage + row
+	if row < 0 || row >= p.PerPage || i >= len(m.picker.VisibleItems()) {
+		return nil
+	}
+	if i == m.picker.Index() {
+		return m.key(enter)
+	}
+	m.picker.Select(i)
+	return nil
+}
+
+func (m *model) clickFooter(x int) tea.Cmd {
+	if m.status != "" { // the footer shows the error instead
+		return nil
+	}
+	ps := m.footerHints()
+	for i := 0; i+1 < len(ps); i += 2 {
+		x -= lipgloss.Width(hints(ps[i], ps[i+1]))
+		if x >= 0 {
+			continue
+		}
+		switch ps[i] {
+		case keyEnter:
+			return m.key(tea.KeyMsg{Type: tea.KeyEnter})
+		case keyEsc:
+			return m.key(tea.KeyMsg{Type: tea.KeyEsc})
+		}
+		return m.key(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(ps[i])})
+	}
+	return nil
+}
+
+// footerHints are the key/label pairs of the footer, which are also what a click on it presses.
+func (m *model) footerHints() []string {
+	hs := []string{keyEnter, "select"}
+	switch m.mode {
+	case modeProjects:
+		hs = append(hs, "/", "search")
+	case modeWindow, modeSeverity:
+	case modeDetail:
+		hs = []string{keyEnter, "filter on field", "e", "exclude field", "/", "search"}
+	case modeFilter, modeRange:
+		return []string{keyEnter, "apply", keyEsc, "cancel"}
+	default:
+		return []string{keyEnter, "fields", "/", "filter", "c", "clear", "p", "project", "t", "window", "s", "severity", "f", "follow", "r", "refresh", keyEsc, "back", "q", "quit"}
+	}
+	return append(hs, keyEsc, "back")
 }
 
 func (m *model) logsKey(k tea.KeyMsg) tea.Cmd {
@@ -585,14 +678,11 @@ func (m *model) View() string {
 		filter += cmp(m.filter, dimStyle.Render("none"))
 	}
 
-	var body, footer string
+	var body string
+	footer := hints(m.footerHints()...)
 	switch m.mode {
-	case modeProjects:
+	case modeProjects, modeWindow, modeSeverity:
 		body = m.picker.View()
-		footer = hints(keyEnter, "select", "/", "search", keyEsc, "back")
-	case modeWindow, modeSeverity:
-		body = m.picker.View()
-		footer = hints(keyEnter, "select", keyEsc, "back")
 	case modeDetail:
 		value := ""
 		if sel, ok := m.picker.SelectedItem().(item); ok {
@@ -600,15 +690,13 @@ func (m *model) View() string {
 		}
 		body = m.picker.View() + "\n" + dimStyle.Render(strings.Repeat("─", inner)) + "\n" +
 			lipgloss.NewStyle().Width(inner).MaxHeight(max(m.bodyH()/3-1, 1)).Render(value)
-		footer = hints(keyEnter, "filter on field", "e", "exclude field", "/", "search", keyEsc, "back")
 	default:
 		body = m.logsView(inner)
-		footer = hints(keyEnter, "fields", "/", "filter", "c", "clear", "p", "project", "t", "window", "s", "severity", "f", "follow", "r", "refresh", keyEsc, "back", "q", "quit")
 		switch m.mode {
 		case modeFilter:
-			footer = hints(keyEnter, "apply", keyEsc, "cancel") + dimStyle.Render(" Logging query language, e.g. resource.type=\"k8s_container\" AND \"timeout\"")
+			footer += dimStyle.Render(" Logging query language, e.g. resource.type=\"k8s_container\" AND \"timeout\"")
 		case modeRange:
-			footer = hints(keyEnter, "apply", keyEsc, "cancel") + dimStyle.Render(" FROM - TO in local time, YYYY-MM-DD HH:MM:SS")
+			footer += dimStyle.Render(" FROM - TO in local time, YYYY-MM-DD HH:MM:SS")
 		}
 	}
 	if m.status != "" {
@@ -769,7 +857,7 @@ func main() {
 	}
 	m := &model{gcp: g, project: *project, filter: *filter, input: textinput.New(), projects: projectItems(loadProjects(projectsCache()))}
 	m.input.Prompt = ""
-	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
+	if _, err := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "glogg:", err)
 		os.Exit(1)
 	}
