@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -22,16 +23,22 @@ const (
 	modeFilter
 	modeDetail
 	modeProjects
+	modeWindow
+	modeSeverity
+	modeRange
 )
 
 const (
 	keyEnter = "enter"
 	keyEsc   = "esc"
+
+	rangeLayout = "2006-01-02 15:04:05"
 )
 
 var (
-	windows    = []time.Duration{time.Hour, 6 * time.Hour, 24 * time.Hour, 7 * 24 * time.Hour}
+	windows    = []time.Duration{10 * time.Minute, time.Hour, 6 * time.Hour, 24 * time.Hour, 7 * 24 * time.Hour}
 	severities = []string{"", "DEBUG", "INFO", "WARNING", "ERROR"}
+	errRange   = errors.New("range must be FROM - TO with TO after FROM, like 2026-11-11 10:41:00 - 2026-11-11 11:00:00")
 
 	// ANSI palette colors so the terminal theme decides the actual look
 	accent     = lipgloss.Color("12")
@@ -81,7 +88,7 @@ func (i item) FilterValue() string { return i.title }
 type view struct {
 	project, filter string
 	window, sev     int
-	since           time.Time // fixed per query so page tokens stay valid
+	since, until    time.Time // fixed per query so page tokens stay valid; until is set only for a custom range
 
 	entries     []entry
 	next        string // page token, "" when there is no more
@@ -99,9 +106,10 @@ type model struct {
 	loading bool
 	status  string
 
-	input    textinput.Model
-	picker   list.Model
-	projects []list.Item
+	input     textinput.Model
+	picker    list.Model
+	projects  []list.Item // from the cache until refreshed
+	refreshed bool        // the project list was fetched this launch
 }
 
 func (m *model) Init() tea.Cmd {
@@ -120,11 +128,13 @@ func (m *model) fetch(more bool) tea.Cmd {
 		token = m.next
 	} else {
 		m.gen++
-		m.since = time.Now().Add(-windows[m.window])
+		if m.until.IsZero() {
+			m.since = time.Now().Add(-windows[m.window])
+		}
 	}
 	m.loading, m.status = true, ""
 	gen, project := m.gen, m.project
-	filter := buildFilter(m.filter, m.since, severities[m.sev])
+	filter := buildFilter(m.filter, m.since, m.until, severities[m.sev])
 	return func() tea.Msg {
 		es, next, err := m.gcp.entries(project, filter, token)
 		return entriesMsg{gen, es, next, more, err}
@@ -153,7 +163,7 @@ func (m *model) back() tea.Cmd {
 	return nil
 }
 
-func (m *model) bodyH() int { return max(m.h-5, 1) } // header, filter, 2 border lines, footer
+func (m *model) bodyH() int { return max(m.h-6, 1) } // header, filter, 2 border lines, graph, footer
 
 func (m *model) resize() {
 	m.input.Width = max(m.w-12, 10)
@@ -162,8 +172,7 @@ func (m *model) resize() {
 	switch m.mode {
 	case modeDetail:
 		h -= h / 3 // the rest shows the selected value in full
-	case modeProjects:
-	default:
+	case modeLogs, modeFilter, modeRange:
 		return // the zero list.Model panics on SetSize
 	}
 	m.picker.SetSize(max(m.w-2, 1), h)
@@ -185,16 +194,38 @@ func (m *model) openPicker(mode mode, title string, items []list.Item) {
 	m.resize()
 }
 
+// openChoice picks one of n fixed options, starting on the current one.
+func (m *model) openChoice(mode mode, title string, n, cur int, label func(int) string) {
+	items := make([]list.Item, n)
+	for i := range items {
+		items[i] = item{title: label(i)}
+	}
+	m.openPicker(mode, title, items)
+	m.picker.SetFilteringEnabled(false) // keeps Index() equal to the option index
+	m.picker.Select(cur)
+}
+
 func (m *model) openProjects() tea.Cmd {
 	m.openPicker(modeProjects, "Projects", m.projects)
-	if m.projects != nil {
+	if m.refreshed {
 		return nil
 	}
-	m.picker.Title = "Projects (loading…)"
+	m.picker.Title = "Projects (refreshing…)"
 	return func() tea.Msg {
 		ps, err := m.gcp.listProjects()
+		if err == nil {
+			_ = saveProjects(projectsCache(), ps) // a failed write only costs the head start next launch
+		}
 		return projectsMsg{ps, err}
 	}
+}
+
+func projectItems(ps []field) []list.Item {
+	items := make([]list.Item, len(ps))
+	for i, p := range ps {
+		items[i] = item{p, p.k + dimStyle.Render("  "+clean(p.v))}
+	}
+	return items
 }
 
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -235,10 +266,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = msg.err.Error()
 			return m, nil
 		}
-		m.projects = make([]list.Item, len(msg.projects))
-		for i, p := range msg.projects {
-			m.projects[i] = item{p, p.k + dimStyle.Render("  "+clean(p.v))}
-		}
+		m.projects, m.refreshed = projectItems(msg.projects), true
 		if m.mode == modeProjects {
 			m.picker.Title = "Projects"
 			return m, m.picker.SetItems(m.projects)
@@ -253,6 +281,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.logsKey(msg)
 		case modeFilter:
 			return m, m.filterKey(msg)
+		case modeRange:
+			return m, m.rangeKey(msg)
 		default:
 			return m, m.pickerKey(msg)
 		}
@@ -260,9 +290,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// everything else (cursor blink, list filter results) belongs to the active widget
 	var cmd tea.Cmd
 	switch m.mode {
-	case modeFilter:
+	case modeFilter, modeRange:
 		m.input, cmd = m.input.Update(msg)
-	case modeDetail, modeProjects:
+	case modeDetail, modeProjects, modeWindow, modeSeverity:
 		m.picker, cmd = m.picker.Update(msg)
 	}
 	return m, cmd
@@ -305,13 +335,20 @@ func (m *model) logsKey(k tea.KeyMsg) tea.Cmd {
 	case "p":
 		return m.openProjects()
 	case "t":
-		m.push()
-		m.window = (m.window + 1) % len(windows)
-		return m.fetch(false)
+		cur := m.window
+		if !m.until.IsZero() {
+			cur = len(windows)
+		}
+		m.openChoice(modeWindow, "Window", len(windows)+1, cur, func(i int) string {
+			if i == len(windows) {
+				return "custom range…"
+			}
+			return fmtWindow(windows[i])
+		})
+		return nil
 	case "s":
-		m.push()
-		m.sev = (m.sev + 1) % len(severities)
-		return m.fetch(false)
+		m.openChoice(modeSeverity, "Minimum severity", len(severities), m.sev, fmtSev)
+		return nil
 	case "c":
 		if m.filter == "" {
 			return nil
@@ -349,6 +386,50 @@ func (m *model) filterKey(k tea.KeyMsg) tea.Cmd {
 	return cmd
 }
 
+func (m *model) rangeKey(k tea.KeyMsg) tea.Cmd {
+	switch k.String() {
+	case keyEsc:
+		m.mode, m.status = modeLogs, ""
+		return nil
+	case keyEnter:
+		from, to, err := parseRange(m.input.Value())
+		if err != nil {
+			m.status = err.Error()
+			return nil
+		}
+		m.mode = modeLogs
+		m.push()
+		m.since, m.until = from, to
+		return m.fetch(false)
+	}
+	m.status = "" // bring the format hint back once the range is being corrected
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(k)
+	return cmd
+}
+
+// pickWindow applies option i of the window picker; the one past the presets asks for a custom range.
+func (m *model) pickWindow(i int) tea.Cmd {
+	if i == len(windows) {
+		from, to := m.since, m.until
+		if to.IsZero() { // start from the window on screen
+			to = time.Now()
+			from = to.Add(-windows[m.window])
+		}
+		m.mode = modeRange
+		m.input.SetValue(from.Format(rangeLayout) + " - " + to.Format(rangeLayout))
+		m.input.CursorEnd()
+		return m.input.Focus()
+	}
+	m.mode = modeLogs
+	if i == m.window && m.until.IsZero() {
+		return nil
+	}
+	m.push()
+	m.window, m.until = i, time.Time{}
+	return m.fetch(false)
+}
+
 func (m *model) pickerKey(k tea.KeyMsg) tea.Cmd {
 	sel, ok := m.picker.SelectedItem().(item)
 	if m.picker.FilterState() != list.Filtering { // while typing a filter every key is text
@@ -361,9 +442,20 @@ func (m *model) pickerKey(k tea.KeyMsg) tea.Cmd {
 			m.project, m.entries, m.next = sel.k, nil, ""
 			m.mode = modeLogs
 			return m.fetch(false)
-		case (key == keyEnter || key == "x") && ok && m.mode == modeDetail:
+		case key == keyEnter && ok && m.mode == modeSeverity:
+			m.mode = modeLogs
+			i := m.picker.Index()
+			if i == m.sev {
+				return nil
+			}
+			m.push()
+			m.sev = i
+			return m.fetch(false)
+		case key == keyEnter && ok && m.mode == modeWindow:
+			return m.pickWindow(m.picker.Index())
+		case (key == keyEnter || key == "e" || key == "-" || key == "x") && ok && m.mode == modeDetail:
 			term := sel.expr()
-			if key == "x" {
+			if key != keyEnter {
 				term = "NOT " + term
 			}
 			if m.filter != "" {
@@ -385,10 +477,6 @@ func (m *model) View() string {
 		return ""
 	}
 	inner := m.w - 2
-	sev := "any"
-	if s := severities[m.sev]; s != "" {
-		sev = "≥" + s
-	}
 	count := fmt.Sprint(len(m.entries))
 	if m.next != "" {
 		count += "+"
@@ -400,17 +488,20 @@ func (m *model) View() string {
 	head.WriteString(titleStyle.Render(" glogg "))
 	for _, kv := range [][2]string{
 		{"project", cmp(m.project, "-")},
-		{"window", fmtWindow(windows[m.window])},
-		{"severity", sev},
+		{"window", m.windowLabel()},
+		{"severity", fmtSev(m.sev)},
 		{"entries", count},
 	} {
 		head.WriteString("  " + dimStyle.Render(kv[0]+":") + " " + kv[1])
 	}
 
 	filter := " " + dimStyle.Render("filter:") + " "
-	if m.mode == modeFilter {
+	switch m.mode {
+	case modeFilter:
 		filter += m.input.View()
-	} else {
+	case modeRange:
+		filter = " " + dimStyle.Render("range:") + " " + m.input.View()
+	default:
 		filter += cmp(m.filter, dimStyle.Render("none"))
 	}
 
@@ -419,6 +510,9 @@ func (m *model) View() string {
 	case modeProjects:
 		body = m.picker.View()
 		footer = hints(keyEnter, "select", "/", "search", keyEsc, "back")
+	case modeWindow, modeSeverity:
+		body = m.picker.View()
+		footer = hints(keyEnter, "select", keyEsc, "back")
 	case modeDetail:
 		value := ""
 		if sel, ok := m.picker.SelectedItem().(item); ok {
@@ -426,12 +520,15 @@ func (m *model) View() string {
 		}
 		body = m.picker.View() + "\n" + dimStyle.Render(strings.Repeat("─", inner)) + "\n" +
 			lipgloss.NewStyle().Width(inner).MaxHeight(max(m.bodyH()/3-1, 1)).Render(value)
-		footer = hints(keyEnter, "filter on field", "x", "exclude field", "/", "search", keyEsc, "back")
+		footer = hints(keyEnter, "filter on field", "e", "exclude field", "/", "search", keyEsc, "back")
 	default:
 		body = m.logsView(inner)
 		footer = hints(keyEnter, "fields", "/", "filter", "c", "clear", "p", "project", "t", "window", "s", "severity", "r", "refresh", keyEsc, "back", "q", "quit")
-		if m.mode == modeFilter {
+		switch m.mode {
+		case modeFilter:
 			footer = hints(keyEnter, "apply", keyEsc, "cancel") + dimStyle.Render(" Logging query language, e.g. resource.type=\"k8s_container\" AND \"timeout\"")
+		case modeRange:
+			footer = hints(keyEnter, "apply", keyEsc, "cancel") + dimStyle.Render(" FROM - TO in local time, YYYY-MM-DD HH:MM:SS")
 		}
 	}
 	if m.status != "" {
@@ -441,6 +538,7 @@ func (m *model) View() string {
 		ansi.Truncate(head.String(), m.w, "…"),
 		ansi.Truncate(filter, m.w, "…"),
 		boxStyle.Width(inner).Height(m.bodyH()).MaxHeight(m.bodyH() + 2).Render(body),
+		ansi.Truncate(m.graphView(), m.w, "…"),
 		ansi.Truncate(footer, m.w, "…"),
 	}, "\n")
 }
@@ -454,7 +552,7 @@ func (m *model) logsView(width int) string {
 	case len(m.entries) == 0 && m.status != "":
 		return "" // the footer shows the error
 	case len(m.entries) == 0:
-		return dimStyle.Render(" No entries match in the last " + fmtWindow(windows[m.window]))
+		return dimStyle.Render(" No entries match (window " + m.windowLabel() + ")")
 	}
 	var b strings.Builder
 	for i := m.top; i < min(m.top+m.bodyH(), len(m.entries)); i++ {
@@ -473,6 +571,42 @@ func (m *model) logsView(width int) string {
 	return b.String()
 }
 
+// graphView is the volume of the loaded entries across the queried time span.
+func (m *model) graphView() string {
+	if m.since.IsZero() {
+		return ""
+	}
+	to := m.until
+	if to.IsZero() {
+		to = m.since.Add(windows[m.window])
+	}
+	const label = "01-02 15:04"
+	return " " + dimStyle.Render(m.since.Format(label)) + " " +
+		keyStyle.Render(sparkline(m.entries, m.since, to, m.w-2*len(label)-4)) + " " + dimStyle.Render(to.Format(label))
+}
+
+// sparkline counts entries per time bucket between from and to, one bar per column, scaled to the busiest bucket.
+// shortcut: counts only the entries loaded so far, so older buckets stay empty until you page down;
+// query Cloud Monitoring's log_entry_count metric if it must show true volume up front.
+func sparkline(es []entry, from, to time.Time, width int) string {
+	if width < 1 {
+		return ""
+	}
+	counts, peak := make([]int, width), 0
+	for _, e := range es {
+		i := int(float64(e.ts.Sub(from)) / float64(to.Sub(from)) * float64(width))
+		i = max(0, min(i, width-1))
+		counts[i]++
+		peak = max(peak, counts[i])
+	}
+	bars := []rune(" ▁▂▃▄▅▆▇█")
+	out := make([]rune, width)
+	for i, c := range counts {
+		out[i] = bars[(c*8+max(peak, 1)-1)/max(peak, 1)] // round up so any entry shows
+	}
+	return string(out)
+}
+
 func hints(pairs ...string) string {
 	var b strings.Builder
 	for i := 0; i+1 < len(pairs); i += 2 {
@@ -488,7 +622,37 @@ func cmp(s, fallback string) string {
 	return s
 }
 
+func fmtSev(i int) string {
+	if severities[i] == "" {
+		return "any"
+	}
+	return "≥" + severities[i]
+}
+
+func (m *model) windowLabel() string {
+	if m.until.IsZero() {
+		return fmtWindow(windows[m.window])
+	}
+	const short = "01-02 15:04:05" // same as the log rows
+	return m.since.Format(short) + " – " + m.until.Format(short)
+}
+
+// parseRange reads "FROM - TO" in local time, both as rangeLayout.
+func parseRange(s string) (time.Time, time.Time, error) {
+	s = strings.TrimSpace(s)
+	n := min(len(s), len(rangeLayout)) // fixed width, so the dashes inside the dates can't be the separator
+	from, err1 := time.ParseInLocation(rangeLayout, s[:n], time.Local)
+	to, err2 := time.ParseInLocation(rangeLayout, strings.TrimLeft(s[n:], " -–"), time.Local)
+	if err1 != nil || err2 != nil || !to.After(from) {
+		return from, to, errRange
+	}
+	return from, to, nil
+}
+
 func fmtWindow(d time.Duration) string {
+	if d < time.Hour {
+		return fmt.Sprintf("%dm", d/time.Minute)
+	}
 	if d >= 24*time.Hour {
 		return fmt.Sprintf("%dd", d/(24*time.Hour))
 	}
@@ -520,7 +684,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "glogg: %v\nTry: gcloud auth application-default login\n", err)
 		os.Exit(1)
 	}
-	m := &model{gcp: g, project: *project, filter: *filter, input: textinput.New()}
+	m := &model{gcp: g, project: *project, filter: *filter, input: textinput.New(), projects: projectItems(loadProjects(projectsCache()))}
 	m.input.Prompt = ""
 	if _, err := tea.NewProgram(m, tea.WithAltScreen()).Run(); err != nil {
 		fmt.Fprintln(os.Stderr, "glogg:", err)

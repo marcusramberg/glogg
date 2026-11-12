@@ -1,6 +1,7 @@
 package main
 
 import (
+	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -37,9 +38,29 @@ func TestToEntry(t *testing.T) {
 
 func TestBuildFilter(t *testing.T) {
 	t.Parallel()
-	got := buildFilter("a OR b", time.Unix(0, 0), "WARNING")
+	got := buildFilter("a OR b", time.Unix(0, 0), time.Time{}, "WARNING")
 	want := `(a OR b) AND timestamp>="1970-01-01T00:00:00Z" AND severity>=WARNING`
 	if got != want {
 		t.Errorf("got %s", got)
+	}
+	got = buildFilter("", time.Unix(0, 0), time.Unix(60, 0), "")
+	want = `timestamp>="1970-01-01T00:00:00Z" AND timestamp<="1970-01-01T00:01:00Z"`
+	if got != want {
+		t.Errorf("got %s", got)
+	}
+}
+
+func TestProjectsCache(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "glogg", "projects.json")
+	if got := loadProjects(path); len(got) != 0 {
+		t.Fatalf("got %v from a missing cache", got)
+	}
+	want := []field{{"a-proj", "A"}, {"b-proj", "B"}}
+	if err := saveProjects(path, want); err != nil {
+		t.Fatal(err)
+	}
+	if got := loadProjects(path); !slices.Equal(got, want) {
+		t.Errorf("got %v", got)
 	}
 }

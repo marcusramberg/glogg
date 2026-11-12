@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"maps"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -110,6 +111,43 @@ func (g *gcp) listProjects() ([]field, error) {
 	return out, nil
 }
 
+// projectsCache is where the project list is kept between launches.
+func projectsCache() string {
+	dir, err := os.UserCacheDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(dir, "glogg", "projects.json")
+}
+
+// loadProjects returns nothing when the cache is missing or unreadable; the refresh fills it in.
+func loadProjects(path string) []field {
+	b, _ := os.ReadFile(path)
+	var m map[string]string
+	_ = json.Unmarshal(b, &m)
+	out := make([]field, 0, len(m))
+	for k, v := range m {
+		out = append(out, field{k, v})
+	}
+	slices.SortFunc(out, func(a, b field) int { return strings.Compare(a.k, b.k) })
+	return out
+}
+
+func saveProjects(path string, ps []field) error {
+	m := make(map[string]string, len(ps))
+	for _, p := range ps {
+		m[p.k] = p.v
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return os.WriteFile(path, b, 0o600)
+}
+
 func toEntry(e *loggingpb.LogEntry) entry {
 	var fs []field
 	// protojson names fields exactly as the query language does (jsonPayload, resource.labels.x, ...)
@@ -185,12 +223,16 @@ func flatten(prefix string, v any, out *[]field) {
 // expr is the query-language term matching this field exactly.
 func (f field) expr() string { return f.k + "=" + strconv.Quote(f.v) }
 
-func buildFilter(user string, since time.Time, minSeverity string) string {
+// buildFilter bounds the query from since up to until; a zero until means up to now.
+func buildFilter(user string, since, until time.Time, minSeverity string) string {
 	var parts []string
 	if user != "" {
 		parts = append(parts, "("+user+")")
 	}
 	parts = append(parts, `timestamp>="`+since.UTC().Format(time.RFC3339)+`"`)
+	if !until.IsZero() {
+		parts = append(parts, `timestamp<="`+until.UTC().Format(time.RFC3339)+`"`)
+	}
 	if minSeverity != "" {
 		parts = append(parts, "severity>="+minSeverity)
 	}
